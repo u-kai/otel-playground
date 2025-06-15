@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/codes"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
@@ -74,6 +75,14 @@ func initDB() (*sql.DB, error) {
 	return db, nil
 }
 
+// エラーをスパンに記録するヘルパー関数
+func recordError(span oteltrace.Span, err error, description string) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, description)
+	}
+}
+
 func (s *PostService) getPost(ctx context.Context, postID int) (*Post, error) {
 	// SQL操作は otelsql で自動計装されるため、手動スパン不要
 	query := "SELECT id, user_id, title, content, created_at FROM posts WHERE id = $1"
@@ -81,6 +90,10 @@ func (s *PostService) getPost(ctx context.Context, postID int) (*Post, error) {
 
 	var post Post
 	if err := row.Scan(&post.ID, &post.UserID, &post.Title, &post.Content, &post.CreatedAt); err != nil {
+		// 現在のスパンがあればエラーを記録
+		if span := oteltrace.SpanFromContext(ctx); span.IsRecording() {
+			recordError(span, err, "Failed to scan post data")
+		}
 		return nil, err
 	}
 
@@ -144,6 +157,15 @@ func (s *PostService) getPostHandler(w http.ResponseWriter, r *http.Request) {
 	// 投稿情報を取得
 	post, err := s.getPost(ctx, postID)
 	if err != nil {
+		// エラーをスパンに記録
+		if span := oteltrace.SpanFromContext(ctx); span.IsRecording() {
+			if err == sql.ErrNoRows {
+				recordError(span, err, "Post not found")
+			} else {
+				recordError(span, err, "Failed to get post")
+			}
+		}
+		
 		if err == sql.ErrNoRows {
 			http.Error(w, "post not found", http.StatusNotFound)
 			return
@@ -219,6 +241,25 @@ func (s *PostService) healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *PostService) errorHandler(w http.ResponseWriter, r *http.Request) {
+	// エラー検証用エンドポイント
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	
+	// 意図的にエラーを発生させる
+	err := fmt.Errorf("intentional database connection error")
+	
+	// エラーをスパンに記録
+	if span := oteltrace.SpanFromContext(ctx); span.IsRecording() {
+		recordError(span, err, "Database connection failed")
+		span.SetAttributes(
+			semconv.HTTPResponseStatusCodeKey.Int(503),
+			semconv.ErrorTypeKey.String("database_error"),
+		)
+	}
+	
+	http.Error(w, "Database temporarily unavailable", http.StatusServiceUnavailable)
+}
+
 func main() {
 	tp, err := initTracer()
 	if err != nil {
@@ -244,6 +285,7 @@ func main() {
 	mux.HandleFunc("/posts", service.getPostHandler)
 	mux.HandleFunc("/posts/by-user", service.getUserPostsHandler)
 	mux.HandleFunc("/health", service.healthHandler)
+	mux.HandleFunc("/error", service.errorHandler)
 
 	// HTTP計装でラップ
 	handler := otelhttp.NewHandler(mux, "post-service")
@@ -253,6 +295,7 @@ func main() {
 	fmt.Println("  GET /posts?id=1 - Get post by ID")
 	fmt.Println("  GET /posts/by-user?user_id=1 - Get posts by user ID")
 	fmt.Println("  GET /health - Health check")
+	fmt.Println("  GET /error - Test error endpoint")
 	fmt.Println("📈 Traces sent to Jaeger: http://localhost:16686")
 
 	if err := http.ListenAndServe(":8081", handler); err != nil {

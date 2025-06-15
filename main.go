@@ -120,6 +120,37 @@ func (c *MicroserviceClient) callService(ctx context.Context, url string) ([]byt
 	return body, nil
 }
 
+func (c *MicroserviceClient) callServiceIgnoreError(ctx context.Context, url string) ([]byte, error) {
+	// エラーテスト用 - HTTPエラーステータスでもエラーとして扱わない
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// トレースコンテキストをリクエストヘッダーに注入
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+
+	// HTTP リクエストを実行
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// エラーステータスでもボディを読み取る
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// HTTPエラーステータスの場合はエラーとして返す
+	if resp.StatusCode >= 400 {
+		return body, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	return body, nil
+}
+
 func (c *MicroserviceClient) getUser(ctx context.Context, userID int) (*User, error) {
 	// HTTP通信は自動計装されるため、手動スパン不要
 	url := fmt.Sprintf("%s/users?id=%d", c.userBaseURL, userID)
@@ -219,6 +250,23 @@ func orchestrateUserData(ctx context.Context, client *MicroserviceClient, userID
 	fmt.Printf("Post ID: %d\n", externalPost.ID)
 	fmt.Printf("Title: %s\n", externalPost.Title)
 	fmt.Printf("Body: %s\n", externalPost.Body)
+
+	// 4. エラーエンドポイントを呼び出してエラートレーシングをテスト
+	fmt.Printf("\n=== Testing Error Tracing ===\n")
+	
+	// user-serviceのエラーエンドポイント
+	fmt.Printf("Testing user-service error endpoint...\n")
+	_, err = client.callServiceIgnoreError(ctx, fmt.Sprintf("%s/error", client.userBaseURL))
+	if err != nil {
+		fmt.Printf("✅ Expected error from user-service: %v\n", err)
+	}
+	
+	// post-serviceのエラーエンドポイント
+	fmt.Printf("Testing post-service error endpoint...\n")
+	_, err = client.callServiceIgnoreError(ctx, fmt.Sprintf("%s/error", client.postBaseURL))
+	if err != nil {
+		fmt.Printf("✅ Expected error from post-service: %v\n", err)
+	}
 
 	return nil
 }
