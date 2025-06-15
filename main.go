@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 type Post struct {
@@ -22,8 +23,16 @@ type Post struct {
 }
 
 func initTracer() (*trace.TracerProvider, error) {
-	exporter, err := stdouttrace.New(
-		stdouttrace.WithPrettyPrint(),
+	exporter, err := otlptracehttp.New(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := resource.New(context.Background(),
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String("otel-playground"),
+			semconv.ServiceVersionKey.String("1.0.0"),
+		),
 	)
 	if err != nil {
 		return nil, err
@@ -31,6 +40,7 @@ func initTracer() (*trace.TracerProvider, error) {
 
 	tp := trace.NewTracerProvider(
 		trace.WithBatcher(exporter),
+		trace.WithResource(res),
 	)
 	otel.SetTracerProvider(tp)
 
@@ -88,5 +98,5 @@ func main() {
 	fmt.Printf("Title: %s\n", post.Title)
 	fmt.Printf("Body: %s\n", post.Body)
 
-	fmt.Fprintln(os.Stderr, "\n--- Trace output above ---")
+	fmt.Println("\nTraces sent to Jaeger! Check http://localhost:16686")
 }
