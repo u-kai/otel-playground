@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
@@ -74,10 +75,7 @@ func initDB() (*sql.DB, error) {
 }
 
 func (s *PostService) getPost(ctx context.Context, postID int) (*Post, error) {
-	tracer := otel.Tracer("post-service")
-	ctx, span := tracer.Start(ctx, "getPost")
-	defer span.End()
-
+	// SQL操作は otelsql で自動計装されるため、手動スパン不要
 	query := "SELECT id, user_id, title, content, created_at FROM posts WHERE id = $1"
 	row := s.db.QueryRowContext(ctx, query, postID)
 
@@ -90,10 +88,7 @@ func (s *PostService) getPost(ctx context.Context, postID int) (*Post, error) {
 }
 
 func (s *PostService) getUserPosts(ctx context.Context, userID int) ([]Post, error) {
-	tracer := otel.Tracer("post-service")
-	ctx, span := tracer.Start(ctx, "getUserPosts")
-	defer span.End()
-
+	// SQL操作は otelsql で自動計装されるため、手動スパン不要
 	query := `
 		SELECT id, user_id, title, content, created_at 
 		FROM posts 
@@ -122,9 +117,16 @@ func (s *PostService) getUserPosts(ctx context.Context, userID int) ([]Post, err
 func (s *PostService) getPostHandler(w http.ResponseWriter, r *http.Request) {
 	// トレースコンテキストをヘッダーから抽出
 	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-	tracer := otel.Tracer("post-service")
-	ctx, span := tracer.Start(ctx, "getPostHandler")
-	defer span.End()
+	
+	// ヘッダーにトレースコンテキストが存在するかチェック
+	spanCtx := oteltrace.SpanContextFromContext(ctx)
+	if !spanCtx.IsValid() {
+		// 新しいトレースを開始（親トレースが存在しない場合）
+		tracer := otel.Tracer("post-service")
+		var span oteltrace.Span
+		ctx, span = tracer.Start(ctx, "getPostHandler")
+		defer span.End()
+	}
 
 	// 投稿IDをクエリパラメータから取得
 	postIDStr := r.URL.Query().Get("id")
@@ -164,9 +166,16 @@ func (s *PostService) getPostHandler(w http.ResponseWriter, r *http.Request) {
 func (s *PostService) getUserPostsHandler(w http.ResponseWriter, r *http.Request) {
 	// トレースコンテキストをヘッダーから抽出
 	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-	tracer := otel.Tracer("post-service")
-	ctx, span := tracer.Start(ctx, "getUserPostsHandler")
-	defer span.End()
+	
+	// ヘッダーにトレースコンテキストが存在するかチェック
+	spanCtx := oteltrace.SpanContextFromContext(ctx)
+	if !spanCtx.IsValid() {
+		// 新しいトレースを開始（親トレースが存在しない場合）
+		tracer := otel.Tracer("post-service")
+		var span oteltrace.Span
+		ctx, span = tracer.Start(ctx, "getUserPostsHandler")
+		defer span.End()
+	}
 
 	// ユーザーIDをクエリパラメータから取得
 	userIDStr := r.URL.Query().Get("user_id")
@@ -200,13 +209,8 @@ func (s *PostService) getUserPostsHandler(w http.ResponseWriter, r *http.Request
 }
 
 func (s *PostService) healthHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-	tracer := otel.Tracer("post-service")
-	ctx, span := tracer.Start(ctx, "healthCheck")
-	defer span.End()
-
-	// レスポンスヘッダーにトレース情報を注入
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(w.Header()))
+	// ヘルスチェックは軽量なので手動スパン不要
+	// otelhttp.NewHandler で自動計装される
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{

@@ -89,9 +89,7 @@ func newMicroserviceClient() *MicroserviceClient {
 }
 
 func (c *MicroserviceClient) callService(ctx context.Context, url string) ([]byte, error) {
-	tracer := otel.Tracer("orchestrator")
-	ctx, span := tracer.Start(ctx, "callService")
-	defer span.End()
+	// HTTP クライアントは otelhttp.NewTransport で自動計装されるため、手動スパン不要
 
 	// HTTP リクエストを作成
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -123,10 +121,7 @@ func (c *MicroserviceClient) callService(ctx context.Context, url string) ([]byt
 }
 
 func (c *MicroserviceClient) getUser(ctx context.Context, userID int) (*User, error) {
-	tracer := otel.Tracer("orchestrator")
-	ctx, span := tracer.Start(ctx, "getUser")
-	defer span.End()
-
+	// HTTP通信は自動計装されるため、手動スパン不要
 	url := fmt.Sprintf("%s/users?id=%d", c.userBaseURL, userID)
 	body, err := c.callService(ctx, url)
 	if err != nil {
@@ -142,10 +137,7 @@ func (c *MicroserviceClient) getUser(ctx context.Context, userID int) (*User, er
 }
 
 func (c *MicroserviceClient) getUserPosts(ctx context.Context, userID int) ([]Post, error) {
-	tracer := otel.Tracer("orchestrator")
-	ctx, span := tracer.Start(ctx, "getUserPosts")
-	defer span.End()
-
+	// HTTP通信は自動計装されるため、手動スパン不要
 	url := fmt.Sprintf("%s/posts/by-user?user_id=%d", c.postBaseURL, userID)
 	body, err := c.callService(ctx, url)
 	if err != nil {
@@ -161,10 +153,7 @@ func (c *MicroserviceClient) getUserPosts(ctx context.Context, userID int) ([]Po
 }
 
 func (c *MicroserviceClient) getExternalPost(ctx context.Context, postID int) (*ExternalPost, error) {
-	tracer := otel.Tracer("orchestrator")
-	ctx, span := tracer.Start(ctx, "getExternalPost")
-	defer span.End()
-
+	// HTTP通信は自動計装されるため、手動スパン不要
 	url := fmt.Sprintf("https://jsonplaceholder.typicode.com/posts/%d", postID)
 	
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -190,6 +179,7 @@ func (c *MicroserviceClient) getExternalPost(ctx context.Context, postID int) (*
 }
 
 func orchestrateUserData(ctx context.Context, client *MicroserviceClient, userID int) error {
+	// 複数サービスの統合処理なので、ビジネスロジック用のスパンを作成
 	tracer := otel.Tracer("orchestrator")
 	ctx, span := tracer.Start(ctx, "orchestrateUserData")
 	defer span.End()

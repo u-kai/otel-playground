@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
@@ -73,10 +74,7 @@ func initDB() (*sql.DB, error) {
 }
 
 func (s *UserService) getUser(ctx context.Context, userID int) (*User, error) {
-	tracer := otel.Tracer("user-service")
-	ctx, span := tracer.Start(ctx, "getUser")
-	defer span.End()
-
+	// SQL操作は otelsql で自動計装されるため、手動スパン不要
 	query := "SELECT id, name, email, created_at FROM users WHERE id = $1"
 	row := s.db.QueryRowContext(ctx, query, userID)
 
@@ -91,9 +89,17 @@ func (s *UserService) getUser(ctx context.Context, userID int) (*User, error) {
 func (s *UserService) getUserHandler(w http.ResponseWriter, r *http.Request) {
 	// トレースコンテキストをヘッダーから抽出
 	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-	tracer := otel.Tracer("user-service")
-	ctx, span := tracer.Start(ctx, "getUserHandler")
-	defer span.End()
+	
+	// ヘッダーにトレースコンテキストが存在するかチェック
+	spanCtx := oteltrace.SpanContextFromContext(ctx)
+	if !spanCtx.IsValid() {
+		// 新しいトレースを開始（親トレースが存在しない場合）
+		tracer := otel.Tracer("user-service")
+		var span oteltrace.Span
+		ctx, span = tracer.Start(ctx, "getUserHandler")
+		defer span.End()
+	}
+	// HTTP操作は otelhttp.NewHandler で自動計装されるため、通常は手動スパン不要
 
 	// ユーザーIDをパスパラメータから取得
 	userIDStr := r.URL.Query().Get("id")
@@ -131,13 +137,8 @@ func (s *UserService) getUserHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *UserService) healthHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-	tracer := otel.Tracer("user-service")
-	ctx, span := tracer.Start(ctx, "healthCheck")
-	defer span.End()
-
-	// レスポンスヘッダーにトレース情報を注入
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(w.Header()))
+	// ヘルスチェックは軽量なので手動スパン不要
+	// otelhttp.NewHandler で自動計装される
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
