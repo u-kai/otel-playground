@@ -14,6 +14,25 @@ services:
     networks:
       - otel-network
 
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_DB: oteldb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: otelpass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - otel-network
+
+volumes:
+  postgres_data:
+
 networks:
   otel-network:
     driver: bridge
