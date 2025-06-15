@@ -2,42 +2,49 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 
-	"github.com/uptrace/opentelemetry-go-extra/otelsql"
-	_ "github.com/lib/pq"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
+// API response types
+type User struct {
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	Email     string `json:"email"`
+	CreatedAt string `json:"created_at"`
+}
+
 type Post struct {
+	ID        int    `json:"id"`
+	UserID    int    `json:"user_id"`
+	Title     string `json:"title"`
+	Content   string `json:"content"`
+	CreatedAt string `json:"created_at"`
+}
+
+// External API types (JSONPlaceholder)
+type ExternalPost struct {
 	UserID int    `json:"userId"`
 	ID     int    `json:"id"`
 	Title  string `json:"title"`
 	Body   string `json:"body"`
 }
 
-type DBPost struct {
-	ID        int    `db:"id"`
-	UserID    int    `db:"user_id"`
-	Title     string `db:"title"`
-	Content   string `db:"content"`
-	CreatedAt string `db:"created_at"`
-}
-
-type User struct {
-	ID        int    `db:"id"`
-	Name      string `db:"name"`
-	Email     string `db:"email"`
-	CreatedAt string `db:"created_at"`
+type MicroserviceClient struct {
+	httpClient   *http.Client
+	userBaseURL  string
+	postBaseURL  string
 }
 
 func initTracer() (*trace.TracerProvider, error) {
@@ -48,7 +55,7 @@ func initTracer() (*trace.TracerProvider, error) {
 
 	res, err := resource.New(context.Background(),
 		resource.WithAttributes(
-			semconv.ServiceNameKey.String("otel-playground"),
+			semconv.ServiceNameKey.String("orchestrator"),
 			semconv.ServiceVersionKey.String("1.0.0"),
 		),
 	)
@@ -61,97 +68,169 @@ func initTracer() (*trace.TracerProvider, error) {
 		trace.WithResource(res),
 	)
 	otel.SetTracerProvider(tp)
+	
+	// トレースコンテキストの伝播設定
+	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	return tp, nil
 }
 
-func initDB() (*sql.DB, error) {
-	db, err := otelsql.Open("postgres", "host=localhost port=5432 user=postgres password=otelpass dbname=oteldb sslmode=disable")
-	if err != nil {
-		return nil, err
+func newMicroserviceClient() *MicroserviceClient {
+	// HTTP クライアントにOTEL計装を追加
+	client := &http.Client{
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
 
-	if err := db.Ping(); err != nil {
-		return nil, err
+	return &MicroserviceClient{
+		httpClient:  client,
+		userBaseURL: "http://localhost:8080",
+		postBaseURL: "http://localhost:8081",
 	}
-
-	return db, nil
 }
 
-func getUserPosts(ctx context.Context, db *sql.DB, userID int) ([]DBPost, error) {
-	tracer := otel.Tracer("otel-playground")
-	ctx, span := tracer.Start(ctx, "getUserPosts")
+func (c *MicroserviceClient) callService(ctx context.Context, url string) ([]byte, error) {
+	tracer := otel.Tracer("orchestrator")
+	ctx, span := tracer.Start(ctx, "callService")
 	defer span.End()
 
-	query := `
-		SELECT id, user_id, title, content, created_at 
-		FROM posts 
-		WHERE user_id = $1 
-		ORDER BY created_at DESC
-	`
-
-	rows, err := db.QueryContext(ctx, query, userID)
+	// HTTP リクエストを作成
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var posts []DBPost
-	for rows.Next() {
-		var post DBPost
-		if err := rows.Scan(&post.ID, &post.UserID, &post.Title, &post.Content, &post.CreatedAt); err != nil {
-			return nil, err
-		}
-		posts = append(posts, post)
+	// トレースコンテキストをリクエストヘッダーに注入
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+
+	// HTTP リクエストを実行
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("service returned status: %d", resp.StatusCode)
 	}
 
-	return posts, nil
+	// レスポンスボディを読み取り
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return body, nil
 }
 
-func getUser(ctx context.Context, db *sql.DB, userID int) (*User, error) {
-	tracer := otel.Tracer("otel-playground")
+func (c *MicroserviceClient) getUser(ctx context.Context, userID int) (*User, error) {
+	tracer := otel.Tracer("orchestrator")
 	ctx, span := tracer.Start(ctx, "getUser")
 	defer span.End()
 
-	query := "SELECT id, name, email, created_at FROM users WHERE id = $1"
-	row := db.QueryRowContext(ctx, query, userID)
+	url := fmt.Sprintf("%s/users?id=%d", c.userBaseURL, userID)
+	body, err := c.callService(ctx, url)
+	if err != nil {
+		return nil, err
+	}
 
 	var user User
-	if err := row.Scan(&user.ID, &user.Name, &user.Email, &user.CreatedAt); err != nil {
+	if err := json.Unmarshal(body, &user); err != nil {
 		return nil, err
 	}
 
 	return &user, nil
 }
 
-func fetchPost(ctx context.Context, postID int) (*Post, error) {
-	tracer := otel.Tracer("otel-playground")
-	ctx, span := tracer.Start(ctx, "fetchPost")
+func (c *MicroserviceClient) getUserPosts(ctx context.Context, userID int) ([]Post, error) {
+	tracer := otel.Tracer("orchestrator")
+	ctx, span := tracer.Start(ctx, "getUserPosts")
+	defer span.End()
+
+	url := fmt.Sprintf("%s/posts/by-user?user_id=%d", c.postBaseURL, userID)
+	body, err := c.callService(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+
+	var posts []Post
+	if err := json.Unmarshal(body, &posts); err != nil {
+		return nil, err
+	}
+
+	return posts, nil
+}
+
+func (c *MicroserviceClient) getExternalPost(ctx context.Context, postID int) (*ExternalPost, error) {
+	tracer := otel.Tracer("orchestrator")
+	ctx, span := tracer.Start(ctx, "getExternalPost")
 	defer span.End()
 
 	url := fmt.Sprintf("https://jsonplaceholder.typicode.com/posts/%d", postID)
 	
-	client := &http.Client{
-		Transport: otelhttp.NewTransport(http.DefaultTransport),
-	}
-
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := client.Do(req)
+	// 外部APIにもトレースコンテキストを注入
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	var post Post
+	var post ExternalPost
 	if err := json.NewDecoder(resp.Body).Decode(&post); err != nil {
 		return nil, err
 	}
 
 	return &post, nil
+}
+
+func orchestrateUserData(ctx context.Context, client *MicroserviceClient, userID int) error {
+	tracer := otel.Tracer("orchestrator")
+	ctx, span := tracer.Start(ctx, "orchestrateUserData")
+	defer span.End()
+
+	// 1. ユーザー情報を取得（user-service経由）
+	user, err := client.getUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	fmt.Printf("=== User Information ===\n")
+	fmt.Printf("User ID: %d\n", user.ID)
+	fmt.Printf("Name: %s\n", user.Name)
+	fmt.Printf("Email: %s\n", user.Email)
+
+	// 2. ユーザーの投稿を取得（post-service経由）
+	posts, err := client.getUserPosts(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("failed to get user posts: %w", err)
+	}
+
+	fmt.Printf("\n=== User Posts (from post-service) ===\n")
+	for i, post := range posts {
+		if i >= 3 { // 最初の3件のみ表示
+			break
+		}
+		fmt.Printf("Post %d: %s\n", post.ID, post.Title)
+	}
+
+	// 3. 外部APIから投稿を取得（比較用）
+	externalPost, err := client.getExternalPost(ctx, 1)
+	if err != nil {
+		return fmt.Errorf("failed to get external post: %w", err)
+	}
+
+	fmt.Printf("\n=== External Post (JSONPlaceholder) ===\n")
+	fmt.Printf("Post ID: %d\n", externalPost.ID)
+	fmt.Printf("Title: %s\n", externalPost.Title)
+	fmt.Printf("Body: %s\n", externalPost.Body)
+
+	return nil
 }
 
 func main() {
@@ -165,50 +244,27 @@ func main() {
 		}
 	}()
 
-	db, err := initDB()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
+	// マイクロサービスクライアントを初期化
+	client := newMicroserviceClient()
 
-	ctx := context.Background()
-	
-	// HTTP APIからデータを取得
-	post, err := fetchPost(ctx, 1)
-	if err != nil {
-		log.Fatal(err)
-	}
+	// メインのオーケストレーション処理を開始
+	tracer := otel.Tracer("orchestrator")
+	ctx, mainSpan := tracer.Start(context.Background(), "main_orchestration")
+	defer mainSpan.End()
 
-	fmt.Printf("=== API Post ===\n")
-	fmt.Printf("Post ID: %d\n", post.ID)
-	fmt.Printf("Title: %s\n", post.Title)
-	fmt.Printf("Body: %s\n", post.Body)
+	fmt.Println("🚀 Starting microservice orchestration...")
+	fmt.Println("📊 This will call:")
+	fmt.Println("  - user-service (localhost:8080)")
+	fmt.Println("  - post-service (localhost:8081)")
+	fmt.Println("  - JSONPlaceholder API (external)")
+	fmt.Println()
 
-	// データベースからユーザー情報を取得
 	userID := 1
-	user, err := getUser(ctx, db, userID)
-	if err != nil {
-		log.Fatal(err)
+	if err := orchestrateUserData(ctx, client, userID); err != nil {
+		log.Fatalf("Orchestration failed: %v", err)
 	}
 
-	fmt.Printf("\n=== Database User ===\n")
-	fmt.Printf("User ID: %d\n", user.ID)
-	fmt.Printf("Name: %s\n", user.Name)
-	fmt.Printf("Email: %s\n", user.Email)
-
-	// データベースからユーザーの投稿を取得
-	posts, err := getUserPosts(ctx, db, userID)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("\n=== Database Posts ===\n")
-	for i, dbPost := range posts {
-		if i >= 3 { // 最初の3件のみ表示
-			break
-		}
-		fmt.Printf("Post %d: %s\n", dbPost.ID, dbPost.Title)
-	}
-
-	fmt.Println("\nTraces sent to Jaeger! Check http://localhost:16686")
+	fmt.Println("\n✅ Orchestration completed successfully!")
+	fmt.Println("📈 End-to-end traces available at: http://localhost:16686")
+	fmt.Println("🔍 Look for 'orchestrator' service in Jaeger UI")
 }
