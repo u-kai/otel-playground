@@ -27,6 +27,8 @@ exporters:
     namespace: "microservices"
     const_labels:
       environment: "development"
+    # Exemplarを有効化
+    enable_open_metrics: true
   
   # Debug logging
   logging:

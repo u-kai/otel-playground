@@ -84,9 +84,43 @@ func initMetrics() (*sdkmetric.MeterProvider, error) {
 		return nil, err
 	}
 
+	// Viewを使ってメトリクスをカスタマイズ
+	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(5*time.Second))
+	
 	mp := sdkmetric.NewMeterProvider(
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(5*time.Second))),
+		sdkmetric.WithReader(reader),
 		sdkmetric.WithResource(res),
+		// Viewを追加：レスポンス時間のバケット設定をカスタマイズ
+		sdkmetric.WithView(
+			sdkmetric.NewView(
+				sdkmetric.Instrument{
+					Name: "user_service_request_duration_seconds",
+				},
+				sdkmetric.Stream{
+					Name:        "user_service_response_time_custom",
+					Description: "Custom bucketed response time for user service",
+					Unit:        "s",
+					Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+						Boundaries: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0},
+					},
+				},
+			),
+		),
+		// Viewを追加：エラーレートを計算する新しいメトリクス
+		sdkmetric.WithView(
+			sdkmetric.NewView(
+				sdkmetric.Instrument{
+					Name: "user_service_requests_total",
+				},
+				sdkmetric.Stream{
+					Name:        "user_service_error_rate",
+					Description: "Error rate for user service",
+					Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+						Boundaries: []float64{200, 300, 400, 500, 600},
+					},
+				},
+			),
+		),
 	)
 	otel.SetMeterProvider(mp)
 
@@ -187,17 +221,25 @@ func (s *UserService) getUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	// HTTP操作は otelhttp.NewHandler で自動計装されるため、通常は手動スパン不要
 
-	// リクエスト処理の最後にメトリクスを記録
+	// リクエスト処理の最後にメトリクスを記録（Exemplar対応）
 	defer func() {
 		duration := time.Since(startTime).Seconds()
-		s.requestCounter.Add(ctx, 1, metric.WithAttributes(
+		
+		// Exemplar: トレースコンテキストを含むメトリクス記録
+		// これによりPrometheusでメトリクスからトレースにジャンプできる
+		attrs := metric.WithAttributes(
 			semconv.HTTPRequestMethodKey.String(r.Method),
 			semconv.HTTPRouteKey.String("/users"),
-		))
-		s.responseTime.Record(ctx, duration, metric.WithAttributes(
-			semconv.HTTPRequestMethodKey.String(r.Method),
-			semconv.HTTPRouteKey.String("/users"),
-		))
+		)
+		
+		s.requestCounter.Add(ctx, 1, attrs)
+		s.responseTime.Record(ctx, duration, attrs)
+		
+		// 特別なメトリクス：時間のかかるリクエストを記録
+		if duration > 0.1 { // 100ms以上
+			fmt.Printf("🐌 Slow request detected: %.3fs for %s %s\n", 
+				duration, r.Method, r.URL.Path)
+		}
 	}()
 
 	// ユーザーIDをパスパラメータから取得
@@ -211,6 +253,15 @@ func (s *UserService) getUserHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "invalid user id", http.StatusBadRequest)
 		return
+	}
+
+	// 🎯 デモ用：意図的に遅延を追加（ViewとExemplarの体験用）
+	if userID == 999 {
+		fmt.Printf("🐌 Simulating slow database query for user %d...\n", userID)
+		time.Sleep(2 * time.Second) // 2秒の遅延
+	} else if userID >= 100 && userID <= 110 {
+		fmt.Printf("⏱️ Medium delay for user %d...\n", userID)
+		time.Sleep(200 * time.Millisecond) // 200msの遅延
 	}
 
 	// ユーザー情報を取得
@@ -254,14 +305,12 @@ func (s *UserService) healthHandler(w http.ResponseWriter, r *http.Request) {
 	// ヘルスチェックのメトリクスを記録
 	defer func() {
 		duration := time.Since(startTime).Seconds()
-		s.requestCounter.Add(r.Context(), 1, metric.WithAttributes(
+		attrs := metric.WithAttributes(
 			semconv.HTTPRequestMethodKey.String(r.Method),
 			semconv.HTTPRouteKey.String("/health"),
-		))
-		s.responseTime.Record(r.Context(), duration, metric.WithAttributes(
-			semconv.HTTPRequestMethodKey.String(r.Method),
-			semconv.HTTPRouteKey.String("/health"),
-		))
+		)
+		s.requestCounter.Add(r.Context(), 1, attrs)
+		s.responseTime.Record(r.Context(), duration, attrs)
 	}()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -284,15 +333,13 @@ func (s *UserService) errorHandler(w http.ResponseWriter, r *http.Request) {
 	// エラーメトリクスを記録
 	defer func() {
 		duration := time.Since(startTime).Seconds()
-		s.requestCounter.Add(ctx, 1, metric.WithAttributes(
+		attrs := metric.WithAttributes(
 			semconv.HTTPRequestMethodKey.String(r.Method),
 			semconv.HTTPRouteKey.String("/error"),
 			semconv.HTTPResponseStatusCodeKey.Int(500),
-		))
-		s.responseTime.Record(ctx, duration, metric.WithAttributes(
-			semconv.HTTPRequestMethodKey.String(r.Method),
-			semconv.HTTPRouteKey.String("/error"),
-		))
+		)
+		s.requestCounter.Add(ctx, 1, attrs)
+		s.responseTime.Record(ctx, duration, attrs)
 	}()
 
 	// 意図的にエラーを発生させる

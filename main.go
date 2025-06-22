@@ -442,6 +442,56 @@ func checkJaegerTraces() (int, error) {
 	return len(result.Data), nil
 }
 
+// 🎯 ViewとExemplarのデモンストレーション
+func demonstrateViewsAndExemplars(ctx context.Context, client *MicroserviceClient) {
+	fmt.Println("📊 Creating different performance scenarios for Views and Exemplars...")
+	
+	// シナリオ1: 通常のリクエスト
+	fmt.Printf("1️⃣ Normal requests (fast)...")
+	for i := 1; i <= 3; i++ {
+		_, err := client.getUser(ctx, i)
+		if err != nil {
+			fmt.Printf(" Error: %v", err)
+		}
+		fmt.Printf(".")
+	}
+	fmt.Println(" ✅")
+	
+	// シナリオ2: 中程度の遅延
+	fmt.Printf("2️⃣ Medium latency requests...")
+	for i := 100; i <= 102; i++ {
+		_, err := client.getUser(ctx, i)
+		if err != nil {
+			fmt.Printf(" Error: %v", err)
+		}
+		fmt.Printf(".")
+	}
+	fmt.Println(" ✅")
+	
+	// シナリオ3: 高遅延リクエスト（Exemplarで特定できる）
+	fmt.Printf("3️⃣ High latency request (will create exemplar)...")
+	_, err := client.getUser(ctx, 999)
+	if err != nil {
+		fmt.Printf(" Error: %v", err)
+	}
+	fmt.Println(" ✅")
+	
+	// シナリオ4: エラーリクエスト
+	fmt.Printf("4️⃣ Error requests (for error rate view)...")
+	for i := 9990; i <= 9992; i++ {
+		_, err := client.getUser(ctx, i)
+		if err != nil {
+			fmt.Printf(".")
+		}
+	}
+	fmt.Println(" ✅")
+	
+	fmt.Println("✨ Views & Exemplars demonstration completed!")
+	fmt.Println("   - Different latency buckets will show in custom histograms")
+	fmt.Println("   - High latency requests will have exemplar links to traces")
+	fmt.Println("   - Error rates will be aggregated in error_rate view")
+}
+
 func orchestrateUserData(ctx context.Context, client *MicroserviceClient, userID int) error {
 	// 複数サービスの統合処理なので、ビジネスロジック用のスパンを作成
 	tracer := otel.Tracer("orchestrator")
@@ -557,6 +607,10 @@ func main() {
 
 	fmt.Println("\n✅ Orchestration completed successfully!")
 	
+	// 🎯 ViewとExemplarのデモ
+	fmt.Println("\n🎯 Demonstrating Views and Exemplars...")
+	demonstrateViewsAndExemplars(ctx, client)
+	
 	// Wait for metrics and traces to be exported
 	fmt.Println("⏳ Waiting 5 seconds for metrics and traces to be exported...")
 	time.Sleep(5 * time.Second)
@@ -570,4 +624,10 @@ func main() {
 	fmt.Println("  - Prometheus UI: http://localhost:9090")
 	fmt.Println("  - OTEL Collector metrics: http://localhost:8889/metrics")
 	fmt.Println("🔍 Look for 'orchestrator', 'user-service', 'post-service' in Jaeger/Prometheus")
+	
+	fmt.Println("\n🎓 View & Exemplar Learning:")
+	fmt.Println("  1. Check Prometheus UI for 'user_service_response_time_custom' (View)")
+	fmt.Println("  2. Look for 'user_service_error_rate' (View)")
+	fmt.Println("  3. Click on exemplar links in histograms to jump to traces (Exemplar)")
+	fmt.Println("  4. Notice custom bucket boundaries in the histogram")
 }
