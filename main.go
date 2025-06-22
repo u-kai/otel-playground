@@ -7,11 +7,16 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
+	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
@@ -42,9 +47,12 @@ type ExternalPost struct {
 }
 
 type MicroserviceClient struct {
-	httpClient   *http.Client
-	userBaseURL  string
-	postBaseURL  string
+	httpClient       *http.Client
+	userBaseURL      string
+	postBaseURL      string
+	operationCounter metric.Int64Counter
+	operationTime    metric.Float64Histogram
+	errorCounter     metric.Int64Counter
 }
 
 func initTracer() (*trace.TracerProvider, error) {
@@ -75,17 +83,72 @@ func initTracer() (*trace.TracerProvider, error) {
 	return tp, nil
 }
 
-func newMicroserviceClient() *MicroserviceClient {
+func initMetrics() (*sdkmetric.MeterProvider, error) {
+	exporter, err := otlpmetrichttp.New(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := resource.New(context.Background(),
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String("orchestrator"),
+			semconv.ServiceVersionKey.String("1.0.0"),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(5*time.Second))),
+		sdkmetric.WithResource(res),
+	)
+	otel.SetMeterProvider(mp)
+
+	return mp, nil
+}
+
+func newMicroserviceClient() (*MicroserviceClient, error) {
 	// HTTP クライアントにOTEL計装を追加
-	client := &http.Client{
+	httpClient := &http.Client{
 		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
 
-	return &MicroserviceClient{
-		httpClient:  client,
-		userBaseURL: "http://localhost:8080",
-		postBaseURL: "http://localhost:8081",
+	meter := otel.Meter("orchestrator")
+
+	operationCounter, err := meter.Int64Counter(
+		"orchestrator_operations_total",
+		metric.WithDescription("Total number of operations performed by orchestrator"),
+	)
+	if err != nil {
+		return nil, err
 	}
+
+	operationTime, err := meter.Float64Histogram(
+		"orchestrator_operation_duration_seconds",
+		metric.WithDescription("Duration of operations performed by orchestrator"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	errorCounter, err := meter.Int64Counter(
+		"orchestrator_errors_total",
+		metric.WithDescription("Total number of errors in orchestrator operations"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &MicroserviceClient{
+		httpClient:       httpClient,
+		userBaseURL:      "http://localhost:8080",
+		postBaseURL:      "http://localhost:8081",
+		operationCounter: operationCounter,
+		operationTime:    operationTime,
+		errorCounter:     errorCounter,
+	}, nil
 }
 
 func (c *MicroserviceClient) callService(ctx context.Context, url string) ([]byte, error) {
@@ -152,15 +215,37 @@ func (c *MicroserviceClient) callServiceIgnoreError(ctx context.Context, url str
 }
 
 func (c *MicroserviceClient) getUser(ctx context.Context, userID int) (*User, error) {
+	startTime := time.Now()
+	
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		c.operationCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("user-service"),
+		))
+		c.operationTime.Record(ctx, duration, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("user-service"),
+		))
+	}()
+
 	// HTTP通信は自動計装されるため、手動スパン不要
 	url := fmt.Sprintf("%s/users?id=%d", c.userBaseURL, userID)
 	body, err := c.callService(ctx, url)
 	if err != nil {
+		c.errorCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("user-service"),
+		))
 		return nil, err
 	}
 
 	var user User
 	if err := json.Unmarshal(body, &user); err != nil {
+		c.errorCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("user-service"),
+		))
 		return nil, err
 	}
 
@@ -168,15 +253,37 @@ func (c *MicroserviceClient) getUser(ctx context.Context, userID int) (*User, er
 }
 
 func (c *MicroserviceClient) getUserPosts(ctx context.Context, userID int) ([]Post, error) {
+	startTime := time.Now()
+	
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		c.operationCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("post-service"),
+		))
+		c.operationTime.Record(ctx, duration, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("post-service"),
+		))
+	}()
+
 	// HTTP通信は自動計装されるため、手動スパン不要
 	url := fmt.Sprintf("%s/posts/by-user?user_id=%d", c.postBaseURL, userID)
 	body, err := c.callService(ctx, url)
 	if err != nil {
+		c.errorCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("post-service"),
+		))
 		return nil, err
 	}
 
 	var posts []Post
 	if err := json.Unmarshal(body, &posts); err != nil {
+		c.errorCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("post-service"),
+		))
 		return nil, err
 	}
 
@@ -184,11 +291,29 @@ func (c *MicroserviceClient) getUserPosts(ctx context.Context, userID int) ([]Po
 }
 
 func (c *MicroserviceClient) getExternalPost(ctx context.Context, postID int) (*ExternalPost, error) {
+	startTime := time.Now()
+	
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		c.operationCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("external-api"),
+		))
+		c.operationTime.Record(ctx, duration, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("external-api"),
+		))
+	}()
+
 	// HTTP通信は自動計装されるため、手動スパン不要
 	url := fmt.Sprintf("https://jsonplaceholder.typicode.com/posts/%d", postID)
 	
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
+		c.errorCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("external-api"),
+		))
 		return nil, err
 	}
 
@@ -197,16 +322,124 @@ func (c *MicroserviceClient) getExternalPost(ctx context.Context, postID int) (*
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		c.errorCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("external-api"),
+		))
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var post ExternalPost
 	if err := json.NewDecoder(resp.Body).Decode(&post); err != nil {
+		c.errorCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.ServiceNameKey.String("external-api"),
+		))
 		return nil, err
 	}
 
 	return &post, nil
+}
+
+// ObservabilityCheck checks if observability tools are working
+func checkObservabilityTools(ctx context.Context, client *MicroserviceClient) {
+	fmt.Println("\n🔍 Checking Observability Tools Status...")
+	
+	// Check OTEL Collector health
+	fmt.Printf("📊 OTEL Collector: ")
+	if err := checkHTTPEndpoint("http://localhost:8889/metrics"); err != nil {
+		fmt.Printf("❌ Not accessible (%v)\n", err)
+	} else {
+		fmt.Printf("✅ Running (metrics endpoint accessible)\n")
+	}
+
+	// Check Prometheus
+	fmt.Printf("📈 Prometheus: ")
+	if err := checkHTTPEndpoint("http://localhost:9090/-/healthy"); err != nil {
+		fmt.Printf("❌ Not accessible (%v)\n", err)
+	} else {
+		fmt.Printf("✅ Running\n")
+	}
+
+	// Check if Prometheus is scraping OTEL Collector metrics
+	fmt.Printf("🔗 Prometheus ← OTEL Collector: ")
+	if metrics, err := checkPrometheusMetrics(); err != nil {
+		fmt.Printf("❌ Metrics not found (%v)\n", err)
+	} else {
+		fmt.Printf("✅ %d OTEL metrics found\n", metrics)
+	}
+
+	// Check Jaeger
+	fmt.Printf("🔍 Jaeger: ")
+	if err := checkHTTPEndpoint("http://localhost:16686/search"); err != nil {
+		fmt.Printf("❌ Not accessible (%v)\n", err)
+	} else {
+		fmt.Printf("✅ Running\n")
+	}
+
+	// Check if Jaeger has received traces
+	fmt.Printf("🔗 Jaeger ← OTEL Collector: ")
+	if traces, err := checkJaegerTraces(); err != nil {
+		fmt.Printf("❌ Traces not found (%v)\n", err)
+	} else {
+		fmt.Printf("✅ %d services found with traces\n", traces)
+	}
+
+	fmt.Println()
+}
+
+func checkHTTPEndpoint(url string) error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func checkPrometheusMetrics() (int, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("http://localhost:9090/api/v1/label/__name__/values")
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+
+	// Count OTEL-related metrics
+	bodyStr := string(body)
+	otelMetrics := strings.Count(bodyStr, "otel_")
+	
+	return otelMetrics, nil
+}
+
+func checkJaegerTraces() (int, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("http://localhost:16686/api/services")
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Data []string `json:"data"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, err
+	}
+
+	return len(result.Data), nil
 }
 
 func orchestrateUserData(ctx context.Context, client *MicroserviceClient, userID int) error {
@@ -282,8 +515,21 @@ func main() {
 		}
 	}()
 
+	mp, err := initMetrics()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := mp.Shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down meter provider: %v", err)
+		}
+	}()
+
 	// マイクロサービスクライアントを初期化
-	client := newMicroserviceClient()
+	client, err := newMicroserviceClient()
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// メインのオーケストレーション処理を開始
 	tracer := otel.Tracer("orchestrator")
@@ -297,12 +543,31 @@ func main() {
 	fmt.Println("  - JSONPlaceholder API (external)")
 	fmt.Println()
 
+	// Wait a bit for services to start up and register metrics/traces
+	fmt.Println("⏳ Waiting 3 seconds for observability tools to collect initial data...")
+	time.Sleep(3 * time.Second)
+
+	// Check observability tools status before starting
+	checkObservabilityTools(ctx, client)
+
 	userID := 1
 	if err := orchestrateUserData(ctx, client, userID); err != nil {
 		log.Fatalf("Orchestration failed: %v", err)
 	}
 
 	fmt.Println("\n✅ Orchestration completed successfully!")
-	fmt.Println("📈 End-to-end traces available at: http://localhost:16686")
-	fmt.Println("🔍 Look for 'orchestrator' service in Jaeger UI")
+	
+	// Wait for metrics and traces to be exported
+	fmt.Println("⏳ Waiting 5 seconds for metrics and traces to be exported...")
+	time.Sleep(5 * time.Second)
+
+	// Check observability tools status after operations
+	fmt.Println("🔍 Post-operation observability check:")
+	checkObservabilityTools(ctx, client)
+
+	fmt.Println("📈 Access URLs:")
+	fmt.Println("  - Jaeger UI: http://localhost:16686")
+	fmt.Println("  - Prometheus UI: http://localhost:9090")
+	fmt.Println("  - OTEL Collector metrics: http://localhost:8889/metrics")
+	fmt.Println("🔍 Look for 'orchestrator', 'user-service', 'post-service' in Jaeger/Prometheus")
 }

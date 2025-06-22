@@ -8,18 +8,22 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/uptrace/opentelemetry-go-extra/otelsql"
 	_ "github.com/lib/pq"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
-	oteltrace "go.opentelemetry.io/otel/trace"
-	"go.opentelemetry.io/otel/codes"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 type Post struct {
@@ -31,7 +35,10 @@ type Post struct {
 }
 
 type PostService struct {
-	db *sql.DB
+	db                *sql.DB
+	requestCounter    metric.Int64Counter
+	responseTime      metric.Float64Histogram
+	activeConnections metric.Int64UpDownCounter
 }
 
 func initTracer() (*trace.TracerProvider, error) {
@@ -60,6 +67,66 @@ func initTracer() (*trace.TracerProvider, error) {
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	return tp, nil
+}
+
+func initMetrics() (*sdkmetric.MeterProvider, error) {
+	exporter, err := otlpmetrichttp.New(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := resource.New(context.Background(),
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String("post-service"),
+			semconv.ServiceVersionKey.String("1.0.0"),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(5*time.Second))),
+		sdkmetric.WithResource(res),
+	)
+	otel.SetMeterProvider(mp)
+
+	return mp, nil
+}
+
+func initServiceMetrics() (*PostService, error) {
+	meter := otel.Meter("post-service")
+
+	requestCounter, err := meter.Int64Counter(
+		"post_service_requests_total",
+		metric.WithDescription("Total number of requests to post service"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	responseTime, err := meter.Float64Histogram(
+		"post_service_request_duration_seconds",
+		metric.WithDescription("Duration of requests to post service"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	activeConnections, err := meter.Int64UpDownCounter(
+		"post_service_active_connections",
+		metric.WithDescription("Number of active connections to post service"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PostService{
+		requestCounter:    requestCounter,
+		responseTime:      responseTime,
+		activeConnections: activeConnections,
+	}, nil
 }
 
 func initDB() (*sql.DB, error) {
@@ -128,6 +195,12 @@ func (s *PostService) getUserPosts(ctx context.Context, userID int) ([]Post, err
 }
 
 func (s *PostService) getPostHandler(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	
+	// アクティブ接続数を増加
+	s.activeConnections.Add(r.Context(), 1)
+	defer s.activeConnections.Add(r.Context(), -1)
+
 	// トレースコンテキストをヘッダーから抽出
 	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 	
@@ -140,6 +213,19 @@ func (s *PostService) getPostHandler(w http.ResponseWriter, r *http.Request) {
 		ctx, span = tracer.Start(ctx, "getPostHandler")
 		defer span.End()
 	}
+
+	// リクエスト処理の最後にメトリクスを記録
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		s.requestCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String(r.Method),
+			semconv.HTTPRouteKey.String("/posts"),
+		))
+		s.responseTime.Record(ctx, duration, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String(r.Method),
+			semconv.HTTPRouteKey.String("/posts"),
+		))
+	}()
 
 	// 投稿IDをクエリパラメータから取得
 	postIDStr := r.URL.Query().Get("id")
@@ -186,6 +272,12 @@ func (s *PostService) getPostHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *PostService) getUserPostsHandler(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	
+	// アクティブ接続数を増加
+	s.activeConnections.Add(r.Context(), 1)
+	defer s.activeConnections.Add(r.Context(), -1)
+
 	// トレースコンテキストをヘッダーから抽出
 	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 	
@@ -198,6 +290,19 @@ func (s *PostService) getUserPostsHandler(w http.ResponseWriter, r *http.Request
 		ctx, span = tracer.Start(ctx, "getUserPostsHandler")
 		defer span.End()
 	}
+
+	// リクエスト処理の最後にメトリクスを記録
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		s.requestCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String(r.Method),
+			semconv.HTTPRouteKey.String("/posts/by-user"),
+		))
+		s.responseTime.Record(ctx, duration, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String(r.Method),
+			semconv.HTTPRouteKey.String("/posts/by-user"),
+		))
+	}()
 
 	// ユーザーIDをクエリパラメータから取得
 	userIDStr := r.URL.Query().Get("user_id")
@@ -231,8 +336,24 @@ func (s *PostService) getUserPostsHandler(w http.ResponseWriter, r *http.Request
 }
 
 func (s *PostService) healthHandler(w http.ResponseWriter, r *http.Request) {
-	// ヘルスチェックは軽量なので手動スパン不要
-	// otelhttp.NewHandler で自動計装される
+	startTime := time.Now()
+	
+	// アクティブ接続数を増加
+	s.activeConnections.Add(r.Context(), 1)
+	defer s.activeConnections.Add(r.Context(), -1)
+
+	// ヘルスチェックのメトリクスを記録
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		s.requestCounter.Add(r.Context(), 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String(r.Method),
+			semconv.HTTPRouteKey.String("/health"),
+		))
+		s.responseTime.Record(r.Context(), duration, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String(r.Method),
+			semconv.HTTPRouteKey.String("/health"),
+		))
+	}()
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -242,8 +363,28 @@ func (s *PostService) healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *PostService) errorHandler(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	
+	// アクティブ接続数を増加
+	s.activeConnections.Add(r.Context(), 1)
+	defer s.activeConnections.Add(r.Context(), -1)
+
 	// エラー検証用エンドポイント
 	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+
+	// エラーメトリクスを記録
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		s.requestCounter.Add(ctx, 1, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String(r.Method),
+			semconv.HTTPRouteKey.String("/error"),
+			semconv.HTTPResponseStatusCodeKey.Int(503),
+		))
+		s.responseTime.Record(ctx, duration, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String(r.Method),
+			semconv.HTTPRouteKey.String("/error"),
+		))
+	}()
 	
 	// 意図的にエラーを発生させる
 	err := fmt.Errorf("intentional database connection error")
@@ -271,15 +412,27 @@ func main() {
 		}
 	}()
 
+	mp, err := initMetrics()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := mp.Shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down meter provider: %v", err)
+		}
+	}()
+
 	db, err := initDB()
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	service := &PostService{
-		db: db,
+	service, err := initServiceMetrics()
+	if err != nil {
+		log.Fatal(err)
 	}
+	service.db = db
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/posts", service.getPostHandler)
@@ -297,6 +450,7 @@ func main() {
 	fmt.Println("  GET /health - Health check")
 	fmt.Println("  GET /error - Test error endpoint")
 	fmt.Println("📈 Traces sent to Jaeger: http://localhost:16686")
+	fmt.Println("📊 Metrics exported to OTLP: http://localhost:4318")
 
 	if err := http.ListenAndServe(":8081", handler); err != nil {
 		log.Fatal(err)
