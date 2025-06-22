@@ -53,8 +53,9 @@ logs-jaeger:
 	docker-compose logs -f jaeger
 
 # 完全クリーンアップ
-clean:
+clean: stop-services
 	docker-compose down -v
+	@rm -f *.pid .*.pid
 	@echo "✅ All services stopped and volumes removed"
 
 # Jaeger UI をブラウザで開く
@@ -87,18 +88,30 @@ run-orchestrator:
 services: up
 	@echo "🚀 Starting all microservices..."
 	@echo "📊 Starting user-service on port 8080..."
-	@(OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 go run cmd/user/main.go) & \
-	echo "📊 Starting post-service on port 8081..." && \
-	(OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 go run cmd/post/main.go) & \
-	echo "✅ All services started in background!" && \
-	echo "🔍 Check status: make status" && \
-	echo "🛑 Stop all: make stop-services"
+	@OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 go run cmd/user/main.go & \
+	echo $$! > .user-service.pid
+	@echo "📊 Starting post-service on port 8081..."
+	@OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 go run cmd/post/main.go & \
+	echo $$! > .post-service.pid
+	@echo "✅ All services started in background!"
+	@echo "🔍 Check status: make status"
+	@echo "🛑 Stop all: make stop-services"
 
 # バックグラウンドサービスを停止
 stop-services:
 	@echo "🛑 Stopping all background services..."
+	@if [ -f .user-service.pid ]; then \
+		kill $$(cat .user-service.pid) 2>/dev/null || true; \
+		rm -f .user-service.pid; \
+	fi
+	@if [ -f .post-service.pid ]; then \
+		kill $$(cat .post-service.pid) 2>/dev/null || true; \
+		rm -f .post-service.pid; \
+	fi
 	@pkill -f "go run cmd/user/main.go" || true
 	@pkill -f "go run cmd/post/main.go" || true
+	@lsof -ti:8080 | xargs kill -9 2>/dev/null || true
+	@lsof -ti:8081 | xargs kill -9 2>/dev/null || true
 	@echo "✅ All services stopped!"
 
 # フルデモ：インフラ起動 → サービス起動 → オーケストレーター実行
