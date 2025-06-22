@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/exemplar"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
@@ -84,43 +85,38 @@ func initMetrics() (*sdkmetric.MeterProvider, error) {
 		return nil, err
 	}
 
-	// Viewを使ってメトリクスをカスタマイズ
+	// 🎯 研究に基づく正しいViews & Exemplars実装
 	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(5*time.Second))
 	
+	// Custom histogram view with custom buckets
+	customHistogramView := sdkmetric.NewView(
+		sdkmetric.Instrument{
+			Name: "user_service_request_duration_seconds",
+		},
+		sdkmetric.Stream{
+			Name:        "user_service_response_time_custom",
+			Description: "Custom histogram with exemplar support",
+			Unit:        "s",
+			Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+				Boundaries: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0},
+			},
+			// 🔗 Custom exemplar reservoir for histograms
+			ExemplarReservoirProviderSelector: func(agg sdkmetric.Aggregation) exemplar.ReservoirProvider {
+				if _, ok := agg.(sdkmetric.AggregationExplicitBucketHistogram); ok {
+					// Use histogram reservoir for histogram aggregation
+					return exemplar.HistogramReservoirProvider([]float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0})
+				}
+				return exemplar.FixedSizeReservoirProvider(10)
+			},
+		},
+	)
+
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(reader),
 		sdkmetric.WithResource(res),
-		// Viewを追加：レスポンス時間のバケット設定をカスタマイズ
-		sdkmetric.WithView(
-			sdkmetric.NewView(
-				sdkmetric.Instrument{
-					Name: "user_service_request_duration_seconds",
-				},
-				sdkmetric.Stream{
-					Name:        "user_service_response_time_custom",
-					Description: "Custom bucketed response time for user service",
-					Unit:        "s",
-					Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
-						Boundaries: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0},
-					},
-				},
-			),
-		),
-		// Viewを追加：エラーレートを計算する新しいメトリクス
-		sdkmetric.WithView(
-			sdkmetric.NewView(
-				sdkmetric.Instrument{
-					Name: "user_service_requests_total",
-				},
-				sdkmetric.Stream{
-					Name:        "user_service_error_rate",
-					Description: "Error rate for user service",
-					Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
-						Boundaries: []float64{200, 300, 400, 500, 600},
-					},
-				},
-			),
-		),
+		sdkmetric.WithView(customHistogramView),
+		// 🔗 Enable trace-based exemplar filtering
+		sdkmetric.WithExemplarFilter(exemplar.TraceBasedFilter),
 	)
 	otel.SetMeterProvider(mp)
 
@@ -234,6 +230,10 @@ func (s *UserService) getUserHandler(w http.ResponseWriter, r *http.Request) {
 		
 		s.requestCounter.Add(ctx, 1, attrs)
 		s.responseTime.Record(ctx, duration, attrs)
+		
+		// 🔍 Debug: Confirm histogram recording
+		fmt.Printf("📊 Recorded histogram: duration=%.3fs, method=%s, route=%s\n", 
+			duration, r.Method, "/users")
 		
 		// 特別なメトリクス：時間のかかるリクエストを記録
 		if duration > 0.1 { // 100ms以上

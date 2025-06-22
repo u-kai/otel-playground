@@ -1,0 +1,26 @@
+apiVersion: 1
+
+datasources:
+  # Prometheus datasource with exemplar support
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      # 🔗 Enable exemplar queries to link to traces
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          url: http://localhost:16686/trace/$${__value.raw}
+          urlDisplayLabel: "View trace in Jaeger"
+        - name: traceID  
+          url: http://localhost:16686/trace/$${__value.raw}
+          urlDisplayLabel: "View trace in Jaeger"
+      
+  # Jaeger datasource for trace visualization  
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: true
